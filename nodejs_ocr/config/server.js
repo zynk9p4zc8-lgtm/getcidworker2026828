@@ -1,0 +1,972 @@
+const config = require('./config.json');
+const express = require('express');
+const cors = require('cors');
+const cookie = require('cookie');
+const fs = require('fs/promises');
+const path = require('path');
+const crypto = require('crypto');
+const multer = require('multer');
+const axios = require('axios');
+const rateLimit = require('express-rate-limit');
+
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true }));
+
+// 全局限流
+const globalLimiter = rateLimit({
+  windowMs: config.GLOBAL_LIMIT_WINDOW,
+  max: config.GLOBAL_LIMIT_MAX,
+  standardHeaders: true,
+  message: { error: '请求过于频繁，请稍后再试' }
+});
+
+// 登录限流
+const loginLimiter = rateLimit({
+  windowMs: config.LOGIN_LIMIT_WINDOW,
+  max: config.LOGIN_LIMIT_MAX,
+  message: { error: '登录尝试过多，请5分钟后再试' }
+});
+
+app.use(globalLimiter);
+
+// IP 黑名单
+let BLACKLIST = config.BLACKLIST;
+const ipVisitMap = new Map();
+const autoBlockMap = new Map();
+
+// 加载黑名单
+async function loadBlackList() {
+  try {
+    const txt = await fs.readFile(config.BLACKLIST_FILE, 'utf8');
+    const arr = JSON.parse(txt);
+    if (Array.isArray(arr)) BLACKLIST = arr;
+  } catch {}
+}
+
+async function saveBlackList() {
+  await fs.writeFile(config.BLACKLIST_FILE, JSON.stringify(BLACKLIST, null, 2), 'utf8');
+}
+
+loadBlackList();
+
+setInterval(() => {
+  const now = Date.now();
+  ipVisitMap.clear();
+  for (const [ip, endTime] of autoBlockMap) {
+    if (now > endTime) autoBlockMap.delete(ip);
+  }
+}, 60 * 1000);
+
+// IP 拦截 🔥 这里修复 async，错误就消失了
+app.use(async (req, res, next) => {
+  const ip = getClientIp(req);
+  const now = Date.now();
+
+  // 🔥 不再每次读文件，直接用内存变量
+  const realBlackList = [...BLACKLIST];
+
+  // 临时自动封禁
+  if (config.BLACKLIST_AUTO_ENABLE && autoBlockMap.has(ip)) {
+    return res.status(403).end();
+  }
+
+  // 永久黑名单
+  if (config.BLACKLIST_ENABLE && realBlackList.includes(ip)) {
+    return res.status(403).end();
+  }
+
+  // 自动计数封禁
+  if (config.BLACKLIST_AUTO_ENABLE) {
+    const count = (ipVisitMap.get(ip) || 0) + 1;
+    ipVisitMap.set(ip, count);
+    if (count >= config.IP_RECORD_LIMIT) {
+      autoBlockMap.set(ip, now + config.BLACKLIST_AUTO_TIME);
+      return res.status(403).end();
+    }
+  }
+
+  next();
+});
+
+// 后台白名单
+app.use('/logs', (req, res, next) => {
+  if (!config.ADMIN_IP_WHITELIST_ENABLE) return next();
+  const ip = getClientIp(req);
+  if (!config.ADMIN_ALLOW_IPS.includes(ip)) {
+    return res.status(403).send('Forbidden');
+  }
+  next();
+});
+
+// ====================== 修复：密码存储（不会清空配置） ======================
+let LOG_PASSWORD = config.LOG_PASSWORD;
+
+// 初始化配置（只读取密码，不覆盖配置文件）
+async function initConfig() {
+  try {
+    const currentConfig = JSON.parse(await fs.readFile(config.CONFIG_PATH, 'utf8'));
+    if (currentConfig.LOG_PASSWORD) {
+      LOG_PASSWORD = currentConfig.LOG_PASSWORD;
+    }
+  } catch (err) {
+    console.log("使用默认配置");
+  }
+}
+
+// 保存密码（只修改密码，其他配置完全保留）
+async function savePassword(newPwd) {
+  try {
+    // 读取完整配置
+    const currentConfig = JSON.parse(await fs.readFile(config.CONFIG_PATH, 'utf8'));
+    // 只改密码
+    currentConfig.LOG_PASSWORD = newPwd;
+    // 写回完整配置
+    await fs.writeFile(config.CONFIG_PATH, JSON.stringify(currentConfig, null, 2), 'utf8');
+    LOG_PASSWORD = newPwd;
+  } catch (err) {
+    console.error("保存密码失败", err);
+  }
+}
+
+initConfig();
+
+// OCR
+if (!config.BAIDU_API_KEY || !config.BAIDU_SECRET_KEY) {
+  console.error('❌ 错误：百度OCR授权信息未配置！');
+  process.exit(1);
+}
+let baiduAccessToken = null;
+let baiduTokenExpireTime = 0;
+
+async function getBaiduAccessToken() {
+  if (baiduAccessToken && Date.now() < baiduTokenExpireTime) {
+    return baiduAccessToken;
+  }
+
+  try {
+    const res = await axios.post('https://aip.baidubce.com/oauth/2.0/token', null, {
+      params: {
+        grant_type: 'client_credentials',
+        client_id: config.BAIDU_API_KEY,
+        client_secret: config.BAIDU_SECRET_KEY
+      },
+      timeout: 10000
+    });
+
+    const data = res.data;
+    if (data.error) throw new Error(`获取Token失败：${data.error_description}`);
+
+    baiduAccessToken = data.access_token;
+    baiduTokenExpireTime = Date.now() + (data.expires_in - 60) * 1000;
+    return baiduAccessToken;
+  } catch (e) {
+    throw new Error('Token请求失败');
+  }
+}
+
+async function baiduAccurateBasicOcr(base64Image) {
+  // 🔥 修复：补上 try {
+  try {
+    const pureBase64 = base64Image.replace(/^data:image\/\w+;base64,/, '');
+    const token = await getBaiduAccessToken();
+
+    const params = new URLSearchParams();
+    params.append('image', pureBase64);
+    params.append('language_type', 'CHN_ENG');
+
+    const res = await axios.post(`${config.ocrUrl}?access_token=${token}`, params, {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      timeout: 10000
+    });
+
+    const result = res.data;
+    if (result.error_code) {
+      throw new Error(`OCR失败[${result.error_code}]：${result.error_msg}`);
+    }
+    return result;
+  } catch (e) {
+    throw new Error(e.message || 'OCR请求失败');
+  }
+}
+
+// 上传
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: config.MAX_FILE_SIZE },
+  fileFilter: (req, file, cb) => {
+    if (config.ALLOW_MIME.includes(file.mimetype)) cb(null, true);
+    else cb(new Error('不支持的文件类型'), false);
+  }
+});
+
+// 日志批处理
+let logBatch = [];
+let lastFlushTime = Date.now();
+let flushing = false;
+
+(async () => {
+  try { await fs.access(config.KV_DIR); } catch { await fs.mkdir(config.KV_DIR); }
+})();
+
+// 工具函数
+function isAuth(req) {
+  const cookies = cookie.parse(req.headers.cookie || '');
+  return cookies.log_token === LOG_PASSWORD;
+}
+
+function eI(t) {
+  const e = t instanceof ArrayBuffer ? new Uint8Array(t) : new TextEncoder().encode(t);
+  let n = '';
+  for (const o of e) n += String.fromCharCode(o);
+  return btoa(n).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+let tI = null;
+async function yT() {
+  if (!tI) {
+    tI = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+  }
+  return tI;
+}
+
+async function c1(t, e) {
+  const key = await yT();
+  const jwk = await crypto.subtle.exportKey('jwk', key.publicKey);
+  const header = eI(JSON.stringify({ alg: 'ES256', typ: 'dpop+jwt', jwk }));
+  const payload = eI(JSON.stringify({
+    htu: t, htm: e, jti: crypto.randomUUID(), iat: Math.floor(Date.now() / 1000)
+  }));
+  const unsigned = header + '.' + payload;
+  const signature = await crypto.subtle.sign(
+    { name: 'ECDSA', hash: 'SHA-256' },
+    key.privateKey,
+    new TextEncoder().encode(unsigned)
+  );
+  return unsigned + '.' + eI(signature);
+}
+
+function GenerateSessionId() {
+  const t = Date.now().toString(36);
+  const e = Math.random().toString(36).substr(2, 9);
+  return `app_${t}_${e}`;
+}
+
+function getFormatTime(offset = config.TIMEZONE) {
+  const now = new Date();
+  const utcTimestamp = now.getTime() + now.getTimezoneOffset() * 60000;
+  const targetTime = new Date(utcTimestamp + 3600000 * offset);
+  const year = targetTime.getFullYear();
+  const month = String(targetTime.getMonth() + 1).padStart(2, '0');
+  const day = String(targetTime.getDate()).padStart(2, '0');
+  const hours = String(targetTime.getHours()).padStart(2, '0');
+  const minutes = String(targetTime.getMinutes()).padStart(2, '0');
+  const seconds = String(targetTime.getSeconds()).padStart(2, '0');
+  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+}
+
+function getClientIp(req) {
+  const forwarded = (req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  if (forwarded && forwarded !== 'unknown') return forwarded;
+  return req.ip || 'unknown';
+}
+
+// ==================== OCR 工具函数 ====================
+// 清洗OCR脏文本：去掉字母、汉字、符号、多余空格换行、客服电话
+function cleanOcrText(rawText) {
+  let txt = rawText
+    // 1. 删除图片文件名相关字符 test、jpg、png、jpeg
+    .replace(/test|jpg|png|jpeg/g, "")
+    // 2. 删除全部字母、中文汉字
+    .replace(/[a-zA-Z\u4e00-\u9fa5]/g, "")
+    // 3. 删除除数字、空格以外所有符号
+    .replace(/[^\d\s]/g, " ")
+    // 4. 多空格/换行统一为单个空格
+    .replace(/\s+/g, " ")
+    // 5. 移除800/400客服电话整串
+    .replace(/\b(800|400)\d+\b/g, " ")
+    // 6. 关键：过滤1-6位孤立短数字碎片（界面零散数字、日期碎片）
+    .replace(/\b\d{1,6}\b/g, " ")
+    .trim();
+  return txt;
+}
+
+function extractIIDs(text) {
+  const results = [];
+  const filteredText = cleanOcrText(text);
+
+  // 标准分段IID：7位9段 / 6位9段
+  const pattern63 = /(?:\d{7}\s){8}\d{7}/g;
+  const pattern54 = /(?:\d{6}\s){8}\d{6}/g;
+
+  const m63 = filteredText.match(pattern63) || [];
+  const m54 = filteredText.match(pattern54) || [];
+
+  for (const s of m63) {
+    const c = s.replace(/\s/g, "");
+    if (c.length === 63) results.push(c);
+  }
+  for (const s of m54) {
+    const c = s.replace(/\s/g, "");
+    if (c.length === 54) results.push(c);
+  }
+
+  // 直接匹配连续长数字串
+  const longDigits = filteredText.match(/\d{54,63}/g) || [];
+  longDigits.forEach(d => {
+    if ([54, 63].includes(d.length)) results.push(d);
+  });
+
+  // 全文纯数字滑动截取，不再只截取开头
+  const pureAll = filteredText.replace(/\D/g, "");
+  // 优先遍历所有63位窗口
+  for (let i = 0; i <= pureAll.length - 63; i++) {
+    const seg = pureAll.slice(i, i + 63);
+    results.push(seg);
+  }
+  // 再遍历所有54位窗口
+  for (let i = 0; i <= pureAll.length - 54; i++) {
+    const seg = pureAll.slice(i, i + 54);
+    results.push(seg);
+  }
+
+  // 去重 + 严格长度过滤
+  return [...new Set(results)].filter(x => [54, 63].includes(x.length));
+}
+
+
+/**
+ * ✅ 获取 Token JSON 数据（供全局使用）
+ * @returns {Promise<Object>}
+ */
+async function getTokenData() {
+  try {
+    // 用你已有的 axios 发送请求，10秒超时
+    const response = await axios({
+      method: 'GET',
+      url: 'https://cidtoken.x2ray.cfd',
+      timeout: 10000, // 10 秒超时
+    });
+
+    const data = response.data;
+
+    // 校验返回数据是否有效
+    if (!data || !data.access_token) {
+      throw new Error('无效的 Token 数据');
+    }
+
+    return data;
+  } catch (err) {
+    let msg = '请求失败';
+
+    // 统一错误处理（和你原来逻辑完全一致）
+    if (err.code === 'ECONNABORTED') {
+      msg = '请求超时';
+    } else if (err.response) {
+      msg = `网络请求失败：HTTP 错误: ${err.response.status}`;
+    } else if (err.message.includes('JSON')) {
+      msg = `解析 JSON 失败：${err.message}`;
+    } else if (err.message === '无效的 Token 数据') {
+      msg = err.message;
+    } else {
+      msg = err.message;
+    }
+
+    throw new Error(msg);
+  }
+}
+
+// 日志写入
+async function flushBatch() {
+  if (flushing || logBatch.length === 0) return;
+  flushing = true;
+  try {
+    const key = 'batch_' + Date.now() + '_' + crypto.randomUUID();
+    const file = path.join(config.KV_DIR, key + '.json');
+    await fs.writeFile(file, JSON.stringify(logBatch), 'utf8');
+    logBatch = [];
+    lastFlushTime = Date.now();
+  } finally {
+    flushing = false;
+  }
+}
+
+function needFlush() {
+  if (logBatch.length >= config.BATCH_SIZE) return true;
+  return (Date.now() - lastFlushTime) / 1000 > config.BATCH_FLUSH_SECONDS;
+}
+
+async function getAllLogs() {
+  try {
+    const files = await fs.readdir(config.KV_DIR);
+    const all = [];
+    for (const f of files.slice(-config.MAX_BATCH_READ)) {
+      try {
+        const txt = await fs.readFile(path.join(config.KV_DIR, f), 'utf8');
+        const arr = JSON.parse(txt);
+        if (Array.isArray(arr)) all.push(...arr);
+      } catch { }
+    }
+    return all.sort((a, b) => (b.time || '').localeCompare(a.time || ''));
+  } catch { return []; }
+}
+
+async function deleteLogById(targetId) {
+  if (!targetId) return false;
+  const files = await fs.readdir(config.KV_DIR);
+  let deleted = false;
+
+  for (const f of files) {
+    const file = path.join(config.KV_DIR, f);
+    try {
+      const txt = await fs.readFile(file, 'utf8');
+      const arr = JSON.parse(txt);
+      if (!Array.isArray(arr)) continue;
+      const filtered = arr.filter(x => x.id !== targetId);
+      if (filtered.length !== arr.length) {
+        deleted = true;
+        if (filtered.length === 0) await fs.unlink(file);
+        else await fs.writeFile(file, JSON.stringify(filtered), 'utf8');
+      }
+    } catch (e) {}
+  }
+  return deleted;
+}
+
+async function clearAllLogs() {
+  const files = await fs.readdir(config.KV_DIR);
+  await Promise.all(files.map(f => fs.unlink(path.join(config.KV_DIR, f))));
+}
+
+// 页面
+function loginPage(msg = '') {
+  return `<!DOCTYPE html><meta charset="utf-8"><title>登录</title><style>body{display:grid;place-items:center;height:100vh;margin:0}.box{padding:24px;background:#fff;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,0.1);width:320px}input,button{width:100%;padding:10px;margin:8px 0;border-radius:6px;border:1px solid #ddd}button{background:#0066cc;color:white;border:none;cursor:pointer}.msg{color:green;text-align:center;margin:8px 0}.err{color:red}</style><div class="box"><h3>日志后台登录</h3>${msg ? `<div class="${msg.includes('成功') ? 'msg' : 'err'}">${msg}</div>` : ''}<form method="post"><input type="password" name="pwd" required placeholder="密码"><button>登录</button></form></div>`;
+}
+
+function changePasswordPage(msg = '') {
+  return `<!DOCTYPE html><meta charset="utf-8"><title>修改登录密码</title>
+<style>
+body{display:grid;place-items:center;height:100vh;margin:0;background:#fafafa}
+.box{padding:24px;background:#fff;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,0.1);width:380px}
+input,button{width:100%;padding:10px;margin:8px 0;border-radius:6px;border:1px solid #ddd}
+button{background:#0066cc;color:white;border:none;cursor:pointer}
+.back{background:#6c757d;margin-top:10px}
+.msg{color:red;text-align:center;margin:8px 0}
+</style>
+<div class="box">
+  <h3>修改日志后台密码</h3>
+  ${msg ? `<div class="msg">${msg}</div>` : ''}
+  <form method="post">
+    <input type="password" name="oldPwd" required placeholder="请输入旧密码">
+    <input type="password" name="newPwd" required placeholder="请输入新密码">
+    <input type="password" name="confirmPwd" required placeholder="请确认新密码">
+    <button type="submit">确认修改</button>
+    <button type="button" class="back" onclick="location.href='/logs'">返回日志页</button>
+  </form>
+</div>`;
+}
+
+function logPage(logs, page, totalPages, search) {
+  const start = (page - 1) * config.PAGE_SIZE;
+  const end = start + config.PAGE_SIZE;
+  const paginated = logs.slice(start, end);
+  const rows = paginated.map(item => `
+  <tr>
+    <td>${item.time || ''}</td>
+    <td style="font-family:monospace">${item.IID || ''}</td>
+    <td>${item.ip || ''}</td>
+    <td>${item.result?.success ? '✅成功' : '❌失败'}</td>
+    <td>
+      <button onclick="del('${item.id}')" style="background:red;color:white;border:none;padding:4px 8px;border-radius:4px;cursor:pointer">删除</button>
+      <button onclick="searchIID('${encodeURIComponent(item.IID || '')}')" style="background:#6c757d;color:white;border:none;padding:4px 8px;border-radius:4px;cursor:pointer;margin:0 2px">同IID</button>
+      <button onclick="showDetail('${encodeURIComponent(JSON.stringify(item.result))}')" style="background:#0066cc;color:white;border:none;padding:4px 8px;border-radius:4px;cursor:pointer;margin:0 2px">详情</button>
+      <button onclick="blockIp('${item.ip}')" style="background:#d32f2f;color:white;border:none;padding:4px 8px;border-radius:4px;cursor:pointer;margin:0 2px">拉黑IP</button>
+      <button onclick="unblockIp('${item.ip}')" style="background:#388e3c;color:white;border:none;padding:4px 8px;border-radius:4px;cursor:pointer;margin:0 2px">解封IP</button>
+    </td>
+  </tr>`).join('');
+
+  const pages = [];
+  for (let i = 1; i <= totalPages; i++) {
+    pages.push(`<a href="?page=${i}&search=${encodeURIComponent(search)}" style="margin:0 5px;color:${page === i ? 'red' : '#0066cc'}">${i}</a>`);
+  }
+
+  return `<!DOCTYPE html><meta charset="utf-8"><title>IID 激活日志</title>
+<style>
+body{margin:20px;font-family:system-ui;background:#fafafa}
+.card{background:white;padding:20px;border-radius:12px;box-shadow:0 2px 10px rgba(0,0,0,0.1)}
+.bar{display:flex;gap:10px;margin:10px 0}
+input{flex:1;padding:8px;border-radius:6px;border:1px solid #ddd}
+button{padding:8px 12px;border:none;border-radius:6px;color:white;cursor:pointer}
+.red{background:red}
+table{width:100%;border-collapse:collapse}
+th,td{padding:10px;border:1px solid #eee}
+#detailModal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:9999;align-items:center;justify-content:center}
+#detailModal .modal-content{background:#fff;border-radius:8px;padding:20px;width:90%;max-width:800px;max-height:80vh;overflow:auto;position:relative}
+#detailModal .modal-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
+#detailModal .modal-header h3{margin:0;font-size:20px}
+#detailModal .btn-group{display:flex;gap:10px}
+#detailModal .btn-copy{background:#28a745;color:white;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-size:16px}
+#detailModal .btn-close{background:#6c757d;color:white;border:none;padding:8px 16px;border-radius:6px;cursor:pointer;font-size:16px}
+#detailContent{background:#f8f9fa;padding:16px;border-radius:6px;white-space:pre-wrap;font-family:monospace;min-height:200px;max-height:50vh;overflow:auto}
+.toast{position:fixed;top:20px;left:50%;transform:translateX(-50%);background:#222;color:#fff;padding:10px 16px;border-radius:10px;opacity:0;transition:0.3s}
+.toast.show{opacity:1;top:30px}
+</style>
+<div class="card">
+  <h3>IID 激活日志</h3>
+  <div class="bar">
+    <input id="s" value="${search}" placeholder="搜索 IID">
+    <button onclick="location.href='?search='+encodeURIComponent(document.getElementById('s').value)">搜索</button>
+    <a href="/logs/change-password"><button style="background:#0066cc;color:white;border:none;padding:8px 12px;border-radius:6px;cursor:pointer">修改密码</button></a>
+    <a href="/logs/clear"><button class="red">清空全部</button></a>
+  </div>
+  <div style="margin:10px 0">${pages.join('')}</div>
+  <table>
+    <tr><th>时间</th><th>IID</th><th>IP</th><th>状态</th><th>操作</th></tr>
+    ${rows}
+  </table>
+</div>
+<div id="detailModal"><div class="modal-content"><div class="modal-header"><h3>激活详情</h3><div class="btn-group"><button class="btn-close" onclick="closeDetailModal()">关闭</button><button class="btn-copy" onclick="copyDetailJson()">复制JSON</button></div></div><div id="detailContent"></div></div></div>
+<div class="toast" id="toast"></div>
+<script>
+const $ = s => document.querySelector(s);
+const toast = msg => { const t=$('#toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2000); };
+function searchIID(iid){ location.href='?search='+decodeURIComponent(iid); }
+function showDetail(s){ try{const r=JSON.parse(decodeURIComponent(s));$('#detailContent').textContent=JSON.stringify(r,null,2);}catch(e){$('#detailContent').textContent='解析失败：'+e;}finally{$('#detailModal').style.display='flex';} }
+function closeDetailModal(){ $('#detailModal').style.display='none'; }
+async function copyDetailJson(){ const txt=$('#detailContent').textContent; if(!txt){toast('暂无内容');return;} try{await navigator.clipboard.writeText(txt);toast('已复制');}catch{toast('复制失败');} }
+async function del(id){ if(!confirm('确认删除？'))return; await fetch('/logs/delete',{method:'POST',body:id}); location.reload(); }
+
+// 拉黑IP
+async function blockIp(ip){
+  if(!confirm('确认拉黑该IP：'+ip+'？')) return;
+  await fetch('/logs/block-ip', {method:'POST', body:ip});
+  toast('已拉黑');
+}
+
+// 解封IP
+async function unblockIp(ip){
+  if(!confirm('确认解封该IP：'+ip+'？')) return;
+  await fetch('/logs/unblock-ip', {method:'POST', body:ip});
+  toast('已解封');
+}
+</script>`;
+}
+
+
+function toolPage() {
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IID 确认 ID 工具</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;font-family:system-ui}
+body{background:#f0f7ff;padding:20px;max-width:800px;margin:0 auto}
+.card{background:#fff;border-radius:16px;box-shadow:0 8px 24px rgba(0,120,212,0.1);padding:24px;margin-bottom:20px}
+h1{font-size:20px;margin-bottom:16px;display:flex;align-items:center;gap:10px}
+img{width:22px;height:22px}
+label{font-weight:600;margin:8px 0;display:block}
+textarea{width:100%;padding:12px;border-radius:10px;border:1px solid #ddd;min-height:120px}
+button{padding:12px 16px;border-radius:10px;border:none;background:#0078d4;color:#fff;font-weight:600;cursor:pointer}
+.btn-gray{background:#64748b}
+.btn-red{background:#d93034}
+.btn-group{display:flex;gap:10px;margin:10px 0;flex-wrap:wrap}
+.result{background:#f8f9fa;padding:12px;border-radius:10px;white-space:pre-wrap;font-family:monospace;min-height:200px;max-height:400px;overflow:auto}
+.status{margin:10px 0;color:#059669}
+.toast{position:fixed;top:20px;left:50%;transform:translateX(-50%);background:#222;color:#fff;padding:10px 16px;border-radius:10px;opacity:0;transition:0.3s}
+.toast.show{opacity:1;top:30px}
+.footer{text-align:center;color:#666;font-size:14px;line-height:1.6;margin-top:24px}
+.footer a{color:#0078dc;text-decoration:none}
+.ocr-box{border:2px dashed #ccc;padding:20px;text-align:center;border-radius:10px;margin:10px 0}
+.preview{max-width:100%;max-height:200px;margin-top:10px;border-radius:8px;display:none}
+</style>
+</head>
+<body>
+
+<div class="card">
+  <h1><img src="https://icons.duckduckgo.com/ip3/microsoft.com.ico"> IID 确认 ID 批量工具</h1>
+  
+  <label>IID 列表（一行一个）</label>
+  <textarea id="iids" placeholder="一行一个 IID，支持批量粘贴"></textarea>
+  <div class="btn-group">
+    <button id="runBtn">获取确认ID</button>
+    <button id="copyBtn" class="btn-gray">复制结果</button>
+    <button id="clearAllBtn" class="btn-red">清空</button>
+  </div>
+
+  <label style="margin-top:20px">📷 图片 OCR 识别（粘贴/拖拽/相册/手机拍照）</label>
+  <div class="ocr-box" id="ocrBox">
+    点击选择相册 / 拖拽图片 / Ctrl+V 粘贴截图 / 手机直接拍照
+    <input type="file" id="imgFile" accept="image/*" hidden>
+    <input type="file" id="cameraFile" accept="image/*" capture="environment" hidden>
+    <div class="btn-group" style="justify-content:center;margin-top:12px">
+      <button onclick="document.getElementById('imgFile').click()">从相册选择图片</button>
+      <button onclick="document.getElementById('cameraFile').click()" class="btn-gray">📸 手机直接拍照</button>
+    </div>
+    <img id="preview" class="preview">
+  </div>
+  <div class="btn-group">
+    <button id="btnOcrIid">OCR识别并获取CID</button>
+    <button id="btnOcrOnly" class="btn-gray">仅OCR识别文字</button>
+  </div>
+
+  <div class="status" id="status"></div>
+  <label>运行结果</label>
+  <div class="result" id="resultBox"></div>
+</div>
+
+<div class="footer">
+  本工具后端服务器通过官方接口 visualsupport.microsoft.com 获取确认 ID<br>
+  数据安全返回并展示于前端页面，仅用于合法授权设备激活<br><br>
+  <a href="/logs">日志后台管理</a>
+  <br><br>本页面使用<a href="https://github.com/wpyok168/cfgetcid" target="_blank">Github</a>开源项目进行部署，如果需要可以自行部署
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const toast = msg => {
+  const t = $("#toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  setTimeout(() => t.classList.remove("show"), 2000);
+};
+
+let currentFile = null;
+const preview = $("#preview");
+
+// 无压缩、无旋转、无对比度处理，原图直接上传，解决识别空白
+// 升级版 setFile 函数：支持自动修正手机拍照旋转 + 压缩
+function setFile(f) {
+  currentFile = f;
+  
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    const img = new Image();
+    img.onload = function() {
+      // 创建 Canvas 进行图像预处理（尺寸缩放与角度矫正）
+      const canvas = document.createElement('canvas');
+      let ctx = canvas.getContext('2d');
+      
+      const MAX_WIDTH = 1280; // 限制最大宽度，提高 OCR 识别率，节省流量
+      let width = img.width;
+      let height = img.height;
+      
+      if (width > MAX_WIDTH) {
+        height = Math.round((height * MAX_WIDTH) / width);
+        width = MAX_WIDTH;
+      }
+      
+      canvas.width = width;
+      canvas.height = height;
+      
+      // 核心：直接将图片绘制进 Canvas，现代浏览器在 Canvas 绘制 Image 时
+      // 已经默认会自动依据 Exif 标志修正旋转（image-orientation: from-image）
+      ctx.drawImage(img, 0, 0, width, height);
+      
+      // 转回 Blob 并更新 currentFile
+      canvas.toBlob(function(blob) {
+        // 创建一个新的 File 对象替代原文件上传
+        currentFile = new File([blob], f.name || "capture.jpg", { type: "image/jpeg" });
+        
+        // 更新预览图
+        preview.src = URL.createObjectURL(currentFile);
+        preview.style.display = 'block';
+        toast('图片已处理（已优化分辨率与旋转）');
+      }, 'image/jpeg', 0.85); // 0.85 压缩率
+    };
+    img.src = e.target.result;
+  };
+  reader.readAsDataURL(f);
+}
+
+$("#clearAllBtn").onclick = () => {
+  $("#iids").value = "";
+  $("#resultBox").textContent = "";
+  $("#status").textContent = "";
+  currentFile = null;
+  preview.src = "";
+  preview.style.display = "none";
+  toast("已清空全部");
+};
+
+$("#copyBtn").onclick = async () => {
+  const txt = $("#resultBox").textContent;
+  if (!txt) { toast("暂无内容"); return; }
+  await navigator.clipboard.writeText(txt);
+  toast("已复制结果");
+};
+
+$("#runBtn").onclick = async () => {
+  const text = $("#iids").value;
+  const lines = text.split("\\n").map(i => i.trim().replace(/\\D/g,"")).filter(Boolean);
+  if (lines.length === 0) { toast("请输入 IID"); return; }
+
+  const btn = $("#runBtn");
+  btn.disabled = true;
+  btn.textContent = "处理中...";
+
+  const output = [];
+  for (const iid of lines) {
+    $("#status").textContent = "处理：" + iid;
+    try {
+      const resp = await fetch("/", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ IID: iid })
+      });
+      const json = await resp.json();
+      output.push(JSON.stringify(json, null, 2) + "\\n------------------------------------\\n");
+    } catch(e) {
+      output.push("请求失败\\n------------------------------------\\n");
+    }
+  }
+
+  $("#resultBox").textContent = output.join("");
+  $("#status").textContent = "完成：" + lines.length + " 条";
+  btn.disabled = false;
+  btn.textContent = "批量获取";
+  toast("处理完成");
+};
+
+document.addEventListener('paste', async e => {
+  const items = e.clipboardData.items;
+  let pasteFile = null;
+  for (const item of items) {
+    if (item.kind === 'file') {
+      pasteFile = item.getAsFile();
+      break;
+    }
+  }
+  if (pasteFile) {
+    e.preventDefault();
+    setFile(pasteFile);
+  }
+});
+
+['dragenter', 'dragover', 'dragleave', 'drop'].forEach(evt => {
+  $('#ocrBox').addEventListener(evt, e => { e.preventDefault(); e.stopPropagation(); });
+});
+$('#ocrBox').addEventListener('drop', e => setFile(e.dataTransfer.files[0]));
+$('#imgFile').onchange = e => setFile(e.target.files[0]);
+$('#cameraFile').onchange = e => setFile(e.target.files[0]);
+
+$('#btnOcrIid').onclick = async () => {
+  if (!currentFile) { toast('请选择图片或拍照'); return; }
+  const fd = new FormData();
+  fd.append('image', currentFile);
+  $('#status').textContent = 'OCR识别中...';
+  const res = await fetch('/api/ocr-iid', { method: 'POST', body: fd });
+  const json = await res.json();
+  $('#resultBox').textContent = JSON.stringify(json, null, 2);
+  $('#status').textContent = '完成';
+  toast('完成');
+};
+
+$('#btnOcrOnly').onclick = async () => {
+  if (!currentFile) { toast('请选择图片'); return; }
+  const fd = new FormData();
+  fd.append('image', currentFile);
+  $('#status').textContent = 'OCR识别中...';
+  const res = await fetch('/api/ocr-only', { method: 'POST', body: fd });
+  const json = await res.json();
+  $('#resultBox').textContent = JSON.stringify(json, null, 2);
+  $('#status').textContent = '完成';
+  toast('完成');
+};
+</script>
+</body>
+</html>`;
+}
+
+// ====================== 激活接口（axios版，无警告） ======================
+async function sendActivationRequest(IID) {
+  if (!IID) throw new Error('missing IID');
+  const dpop = await c1('/api/productActivation/validateIID', 'POST');
+  const sid = GenerateSessionId();
+  const tokenJson = await getTokenData();
+  if (!tokenJson || !tokenJson.access_token) {
+    throw new Error("获取 AccessToken 失败，请检查网络或接口");
+  }
+
+  try {
+    const res = await axios.post('https://visualsupport.microsoft.com/api/productActivation/validateIID', {
+      IID, ProductType: 'windows', productGroup: 'Windows', productName: 'Windows 11',
+      numberOfDigits: Math.floor(IID.length / 9), Country: 'CHN', Region: 'APAC', InstalledDevices: 1,
+      OverrideStatusCode: 'MUL', InitialReasonCode: '45164'
+    }, {
+      headers: {
+        'Content-Type': 'application/json',
+        //'Authorization': 'Bearer govUrlID',
+        'Authorization': `Bearer ${tokenJson.id_token}`,
+        'DPoP': dpop,
+        'x-session-id': sid
+      },
+      timeout: 10000
+    });
+
+    return { status: res.status, success: true, data: res.data };
+  } catch (e) {
+    return { status: e.response?.status || 500, success: false, data: e.message };
+  }
+}
+
+// ====================== OCR 接口 ======================
+app.post('/api/ocr-iid', upload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: '请上传图片' });
+    const base64 = req.file.buffer.toString('base64');
+    const ocr = await baiduAccurateBasicOcr(base64);
+    const text = ocr.words_result?.map(p => p.words).join('\n') || '';
+    const iids = extractIIDs(text);
+    if (iids.length === 0) return res.json({ error: "未识别到IID", ocrText: text });
+    const first = iids[0];
+    const result = await sendActivationRequest(first);
+    logBatch.push({ id: crypto.randomUUID(), time: getFormatTime(), IID: first, ip: getClientIp(req), result });
+    if (needFlush()) flushBatch();
+    return res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/ocr-only', upload.single('image'), async (req, res) => {
+  try {
+    const base64 = req.file.buffer.toString('base64');
+    const ocr = await baiduAccurateBasicOcr(base64);
+    const text = ocr.words_result?.map(p => p.words).join('\n') || '';
+    res.json({ ocrText: text });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ====================== 路由 ======================
+// 手动添加IP到黑名单（后台鉴权）
+app.post('/logs/block-ip', async (req,res)=>{
+  if(!isAuth(req)) return res.sendStatus(403);
+  let ip = '';
+  try{
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    ip = Buffer.concat(chunks).toString('utf8').trim();
+  }catch{}
+  if(!ip) return res.send('empty');
+  if(!BLACKLIST.includes(ip)){
+    BLACKLIST.push(ip);
+    await saveBlackList();
+  }
+  res.send('ok');
+});
+
+// 移除黑名单IP
+app.post('/logs/unblock-ip', async (req,res)=>{
+  if(!isAuth(req)) return res.sendStatus(403);
+  let ip = '';
+  try{
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    ip = Buffer.concat(chunks).toString('utf8').trim();
+  }catch{}
+
+  // 🔥 移除永久黑名单
+  BLACKLIST = BLACKLIST.filter(item=>item!==ip);
+  await saveBlackList();
+
+  // 🔥 关键：同步清除临时封禁，做到实时
+  autoBlockMap.delete(ip);
+  ipVisitMap.delete(ip);
+
+  res.send('ok');
+});
+
+app.all('/logs/change-password', async (req, res) => {
+  if (!isAuth(req)) return res.send(loginPage());
+  if (req.method === 'POST') {
+    const { oldPwd, newPwd, confirmPwd } = req.body;
+    if (oldPwd !== LOG_PASSWORD) return res.send(changePasswordPage('❌ 旧密码错误'));
+    if (newPwd !== confirmPwd) return res.send(changePasswordPage('❌ 两次密码不一致'));
+    if (!newPwd.trim()) return res.send(changePasswordPage('❌ 新密码不能为空'));
+    await savePassword(newPwd.trim());
+    
+    res.clearCookie('log_token', { path: '/logs' });
+    return res.redirect('/logs?msg=密码修改成功，请使用新密码登录');
+  }
+  res.send(changePasswordPage());
+});
+
+app.get('/logs/clear', async (req, res) => {
+  if (!isAuth(req)) return res.sendStatus(403);
+  await clearAllLogs();
+  res.redirect('/logs');
+});
+
+app.post('/logs/delete', async (req, res) => {
+  if (!isAuth(req)) return res.sendStatus(403);
+  let id = '';
+  try {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    id = Buffer.concat(chunks).toString('utf8').trim();
+  } catch (e) {}
+
+  if (!id) return res.send('no id');
+  await deleteLogById(id);
+  res.send('ok');
+});
+
+app.use('/logs', loginLimiter);
+app.all('/logs', async (req, res) => {
+  const msg = req.query.msg || '';
+  if (req.method === 'POST') {
+    const pwd = req.body.pwd;
+    if (pwd === LOG_PASSWORD) {
+      return res.cookie('log_token', LOG_PASSWORD, {
+        path: '/logs', httpOnly: true, maxAge: 86400, sameSite: 'lax'
+      }).redirect('/logs');
+    }
+    return res.send(loginPage('❌ 密码错误'));
+  }
+  if (!isAuth(req)) return res.send(loginPage(msg));
+  await flushBatch();
+  const search = req.query.search || '';
+  const page = parseInt(req.query.page) || 1;
+  const logs = await getAllLogs();
+  const filtered = search ? logs.filter(x => (x.IID || '').includes(search)) : logs;
+  const totalPages = Math.ceil(filtered.length / config.PAGE_SIZE);
+  res.send(logPage(filtered, page, totalPages, search));
+});
+
+app.all('/', async (req, res) => {
+  if (req.method === 'GET') return res.send(toolPage());
+  try {
+    const { IID } = req.body;
+    if (!IID) return res.status(400).json({ error: 'missing IID' });
+    const ip = getClientIp(req);
+    const result = await sendActivationRequest(IID);
+    logBatch.push({ id: crypto.randomUUID(), time: getFormatTime(), IID, ip, result });
+    if (needFlush()) flushBatch();
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: 'error', detail: err + '' });
+  }
+});
+
+// 错误捕获
+app.use((err, req, res, next) => {
+  console.error('服务器异常：', err);
+  res.status(500).json({ error: 'server error' });
+});
+
+// 启动
+app.listen(config.PORT, '0.0.0.0', () => {
+  console.log(`✅ 服务已启动：http://127.0.0.1:${config.PORT}`);
+  console.log(`🌐 公网/IP访问：http://【你的服务器IP】:${config.PORT}`);
+  console.log(`🔑 日志后台密码：${LOG_PASSWORD}`);
+  console.log(`📷 图片OCR识别 → 自动获取CID`);
+  console.log(`🔐 修改密码后强制重新登录`);
+  console.log(`🔐 限流+上传校验+IP黑名单+后台白名单`);
+});

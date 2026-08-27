@@ -1,0 +1,35 @@
+{
+  "PORT": 9567,
+  "TIMEZONE": 8,
+  "LOG_PASSWORD": "123456",
+
+  "KV_DIR": "kv_logs",
+  "CONFIG_PATH": "config.json",
+  "BLACKLIST_FILE": "blacklist.json",
+
+  "BATCH_SIZE": 20,
+  "BATCH_FLUSH_SECONDS": 300,
+  "MAX_BATCH_READ": 50,
+  "PAGE_SIZE": 20,
+
+  "BAIDU_API_KEY": "OFClXkRRS9TRRTDvnKMk4TS1",
+  "BAIDU_SECRET_KEY": "cyWM6fnvKn5eeLAR6WBGZwYkU2OufuOJ",
+  "ocrUrl": "https://aip.baidubce.com/rest/2.0/ocr/v1/general_basic",
+
+  "ALLOW_MIME": ["image/jpeg", "image/png", "image/jpg", "image/gif"],
+  "MAX_FILE_SIZE": 20971520,
+
+  "GLOBAL_LIMIT_WINDOW": 60000,
+  "GLOBAL_LIMIT_MAX": 60,
+  "LOGIN_LIMIT_WINDOW": 300000,
+  "LOGIN_LIMIT_MAX": 10,
+
+  "BLACKLIST_ENABLE": true,
+  "BLACKLIST_AUTO_ENABLE": true,
+  "BLACKLIST_AUTO_TIME": 600000,
+  "IP_RECORD_LIMIT": 80,
+  "BLACKLIST": [],
+
+  "ADMIN_IP_WHITELIST_ENABLE": false,
+  "ADMIN_ALLOW_IPS": ["127.0.0.1", "::1"]
+}
